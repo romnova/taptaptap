@@ -43,14 +43,14 @@ import {
   getUpgradeCost,
 } from './game/catData';
 import {
-  initPortalBridge,
+  initYandexSdk,
   notifyGameplayStart,
   notifyGameplayStop,
-  notifyHappyTime,
+  notifyYandexLoadingReady,
   safeLoadStorage,
   safeSaveStorage,
-  tryPortalInterstitialAd,
-  tryPortalRewardedVideo,
+  showYandexFullscreenAd,
+  showYandexRewardedVideo,
 } from './game/portalBridge';
 import { SceneController } from './game/SceneController';
 import {
@@ -215,7 +215,8 @@ export default function App() {
   const adPausedRef = useRef(false);
   const hiddenPausedRef = useRef(false);
   const hardPausedRef = useRef(false);
-  const lastInterstitialAtRef = useRef(0);
+  const gameStartedAtRef = useRef<number>(Date.now());
+  const lastInterstitialAtRef = useRef<number>(0);
 
   const syncHardPause = useCallback(() => {
     const paused = adPausedRef.current || hiddenPausedRef.current;
@@ -224,20 +225,20 @@ export default function App() {
     sceneRef.current?.setPaused(paused);
   }, []);
 
-  const showInterstitialWithPause = useCallback(
-    async (force = false) => {
-      const now = Date.now();
-      if (!force && now - lastInterstitialAtRef.current < 75000) {
-        return;
-      }
-      lastInterstitialAtRef.current = now;
-      await tryPortalInterstitialAd((paused) => {
-        adPausedRef.current = paused;
-        syncHardPause();
-      });
-    },
-    [syncHardPause],
-  );
+  const showInterstitialWithCooldown = useCallback(async () => {
+    const now = Date.now();
+    if (now - gameStartedAtRef.current < 60000) {
+      return;
+    }
+    if (lastInterstitialAtRef.current > 0 && now - lastInterstitialAtRef.current < 120000) {
+      return;
+    }
+    lastInterstitialAtRef.current = now;
+    await showYandexFullscreenAd((paused) => {
+      adPausedRef.current = paused;
+      syncHardPause();
+    });
+  }, [syncHardPause]);
 
   const pushFloating = useCallback(
     (
@@ -266,10 +267,8 @@ export default function App() {
     return () => window.clearTimeout(t);
   }, [toastMsg]);
 
-  // Unlock Web Audio Ambient & initialize Game Portal SDK Bridge
+  // Unlock Web Audio Ambient & handle tab visibility pause/resume
   useEffect(() => {
-    void initPortalBridge();
-
     const handleFirstGesture = () => {
       soundEngine.unlockAudio();
     };
@@ -519,10 +518,9 @@ export default function App() {
           });
 
           if (isNewBreed) {
-            notifyHappyTime();
             showToast(`Открыта новая порода: ${CAT_TIERS[newLevel - 1].name}!`);
-            if (newLevel >= 5 && newLevel % 2 === 1) {
-              void showInterstitialWithPause(false);
+            if (newLevel >= 4) {
+              void showInterstitialWithCooldown();
             }
           }
 
@@ -614,11 +612,19 @@ export default function App() {
     controller.setPs2Filter(stateRef.current.ps2Filter);
     controller.setAsmrMode(stateRef.current.asmrMode);
 
+    // Initialize Yandex Games SDK and call LoadingAPI.ready() strictly once after 3D scene & UI are ready
+    void initYandexSdk().then(() => {
+      notifyYandexLoadingReady();
+      if (!document.hidden && !hardPausedRef.current) {
+        notifyGameplayStart();
+      }
+    });
+
     return () => {
       controller.dispose();
       sceneRef.current = null;
     };
-  }, [pushFloating, showToast, showInterstitialWithPause]);
+  }, [pushFloating, showToast, showInterstitialWithCooldown]);
 
   // Sync board, theme, PS2 filter, ASMR mode, fish rain & fever state
   useEffect(() => {
@@ -977,12 +983,12 @@ export default function App() {
           ...base,
           coins: base.coins + instantBurst,
           gems: base.gems + 5,
-          doubleIncomeUntil: Date.now() + 90000,
+          doubleIncomeUntil: Date.now() + 120000,
           dailyProgress: { ...base.dailyProgress, ads: base.dailyProgress.ads + 1 },
         };
       });
       showToast(
-        `Турбо x2 на 90с! Скорость посылок x2, +${formatCoins(instantBurst)} М и +5 С!`,
+        `x2 Доход на 2 мин! Скорость посылок x2, +${formatCoins(instantBurst)} М и +5 С!`,
       );
     } else if (offer.id === 'crate_frenzy') {
       const emptyIndices: number[] = [];
@@ -1077,6 +1083,19 @@ export default function App() {
         };
       });
       showToast(`Элитный кот Ур. ${bonusLvl} высажен на доску (+5 С)!`);
+    } else if (offer.id === 'offline_double') {
+      const amount = offlineCoins * 2;
+      setState((prev) => {
+        const base = ensureDailyReset(prev);
+        return {
+          ...base,
+          coins: base.coins + amount,
+          gems: base.gems + 5,
+          dailyProgress: { ...base.dailyProgress, ads: base.dailyProgress.ads + 1 },
+        };
+      });
+      setOfflineCoins(0);
+      showToast(`Оффлайн-доход удвоен: +${formatCoins(amount)} М и +5 С!`);
     }
 
     setAdOffer(null);
@@ -1084,12 +1103,18 @@ export default function App() {
   };
 
   const openRewardedAd = async (offer: RewardedAdOffer) => {
-    const portalResult = await tryPortalRewardedVideo((paused) => {
-      adPausedRef.current = paused;
-      syncHardPause();
-    });
-    if (portalResult === 'rewarded') {
-      applyAdReward(offer);
+    let rewardedViaCallback = false;
+    const portalResult = await showYandexRewardedVideo(
+      (paused) => {
+        adPausedRef.current = paused;
+        syncHardPause();
+      },
+      () => {
+        rewardedViaCallback = true;
+        applyAdReward(offer);
+      },
+    );
+    if (portalResult === 'rewarded' || rewardedViaCallback) {
       return;
     }
     if (portalResult === 'declined') {
@@ -1177,9 +1202,8 @@ export default function App() {
   const handlePrestige = async () => {
     const gain = getPendingGoldenFish(state.highestUnlockedLevel, state.totalMerges);
     if (gain <= 0) return;
-    await showInterstitialWithPause(true);
+    await showInterstitialWithCooldown();
     soundEngine.playFever();
-    notifyHappyTime();
     setState((prev) =>
       createInitialState({
         gems: prev.gems,
@@ -1314,7 +1338,6 @@ export default function App() {
     );
     if (!completedAll) return;
     soundEngine.playFever();
-    notifyHappyTime();
     setState((prev) => {
       const base = ensureDailyReset(prev);
       return {
@@ -1328,15 +1351,23 @@ export default function App() {
   };
 
   const handleClaimOffline = (doubled: boolean) => {
-    const amount = doubled ? offlineCoins * 2 : offlineCoins;
+    if (doubled) {
+      void openRewardedAd({
+        id: 'offline_double',
+        title: 'Удвоить оффлайн-доход',
+        description: `Посмотри короткий ролик, чтобы получить x2 монет (+${formatCoins(offlineCoins * 2)} М) и +5 Самоцветов!`,
+        rewardLabel: `+${formatCoins(offlineCoins * 2)} монет`,
+      });
+      return;
+    }
     soundEngine.playCoin();
     setState((prev) => ({
       ...prev,
-      coins: prev.coins + amount,
+      coins: prev.coins + offlineCoins,
     }));
     setOfflineCoins(0);
     setActiveModal(null);
-    showToast(`Зачислено +${formatCoins(amount)} монет!`);
+    showToast(`Зачислено +${formatCoins(offlineCoins)} монет!`);
   };
 
   const handleFinishTutorial = () => {
@@ -1554,6 +1585,12 @@ export default function App() {
                 {comboActive && (
                   <div className="rounded-lg border border-amber-500/40 bg-amber-500 px-2 py-0.5 text-[10px] sm:text-[11px] font-extrabold font-mono-num text-slate-950 shadow-sm whitespace-nowrap">
                     КОМБО x{comboCount}
+                  </div>
+                )}
+
+                {doubleActive && (
+                  <div className="rounded-lg border border-emerald-500/40 bg-[#0FA968] px-2 py-0.5 text-[10px] sm:text-[11px] font-extrabold font-mono-num text-white shadow-sm whitespace-nowrap">
+                    x2 Доход · {doubleSecondsLeft}с
                   </div>
                 )}
 
@@ -2104,13 +2141,13 @@ export default function App() {
               onClick={() =>
                 openRewardedAd({
                   id: 'double_income',
-                  title: 'Турбо Буст x2',
+                  title: 'x2 Доход на 2 мин',
                   description:
-                    'Посмотри ролик: удвой доход котов и скорость появления посылок на 90 секунд + получи мгновенный бонус монет!',
-                  rewardLabel: 'x2 Доход и Посылки на 90с',
+                    'Посмотри короткий ролик: удвой доход котов и скорость появления посылок на 2 минуты (120с) + получи мгновенный бонус монет!',
+                  rewardLabel: 'x2 Доход и Посылки на 2 минуты',
                 })
               }
-              className={`flex min-h-[44px] items-center gap-1.5 rounded-xl px-3 sm:px-4 py-2.5 text-xs font-bold transition-colors whitespace-nowrap ${
+              className={`flex min-h-[44px] items-center gap-1.5 rounded-xl px-3 sm:px-4 py-2.5 text-xs font-bold transition-all active:scale-[0.97] whitespace-nowrap ${
                 doubleActive
                   ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-300'
                   : 'bg-[#0FA968] text-white hover:bg-[#0C8E57]'
@@ -2118,7 +2155,7 @@ export default function App() {
             >
               <Play className="h-3.5 w-3.5 fill-current shrink-0" />
               <span>
-                {doubleActive ? `x2 (${doubleSecondsLeft}с)` : 'Буст x2'}
+                {doubleActive ? `x2 (${doubleSecondsLeft}с)` : 'x2 Доход на 2 мин'}
               </span>
             </button>
           </div>
