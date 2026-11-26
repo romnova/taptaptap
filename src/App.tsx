@@ -49,6 +49,7 @@ import {
   notifyHappyTime,
   safeLoadStorage,
   safeSaveStorage,
+  tryPortalInterstitialAd,
   tryPortalRewardedVideo,
 } from './game/portalBridge';
 import { SceneController } from './game/SceneController';
@@ -211,6 +212,33 @@ export default function App() {
   const stateRef = useRef<GameState>(state);
   stateRef.current = state;
 
+  const adPausedRef = useRef(false);
+  const hiddenPausedRef = useRef(false);
+  const hardPausedRef = useRef(false);
+  const lastInterstitialAtRef = useRef(0);
+
+  const syncHardPause = useCallback(() => {
+    const paused = adPausedRef.current || hiddenPausedRef.current;
+    hardPausedRef.current = paused;
+    soundEngine.setBackgroundPaused(paused);
+    sceneRef.current?.setPaused(paused);
+  }, []);
+
+  const showInterstitialWithPause = useCallback(
+    async (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastInterstitialAtRef.current < 75000) {
+        return;
+      }
+      lastInterstitialAtRef.current = now;
+      await tryPortalInterstitialAd((paused) => {
+        adPausedRef.current = paused;
+        syncHardPause();
+      });
+    },
+    [syncHardPause],
+  );
+
   const pushFloating = useCallback(
     (
       text: string,
@@ -247,7 +275,8 @@ export default function App() {
     };
     const handleVisibility = () => {
       const hidden = document.hidden;
-      soundEngine.setBackgroundPaused(hidden);
+      hiddenPausedRef.current = hidden;
+      syncHardPause();
       if (hidden) {
         notifyGameplayStop();
       } else {
@@ -263,7 +292,19 @@ export default function App() {
       window.removeEventListener('keydown', handleFirstGesture);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, []);
+  }, [syncHardPause]);
+
+  // Hard pause audio + 3D scene while local fallback ad modal is open
+  useEffect(() => {
+    const isAdModal = activeModal === 'ad';
+    adPausedRef.current = isAdModal;
+    syncHardPause();
+    if (isAdModal) {
+      notifyGameplayStop();
+    } else {
+      notifyGameplayStart();
+    }
+  }, [activeModal, syncHardPause]);
 
   // Check offline earnings once on mount
   useEffect(() => {
@@ -441,6 +482,8 @@ export default function App() {
           soundEngine.playMerge(newLevel, nextCombo);
           controller.triggerMergeEffect(toIndex, newLevel);
 
+          const isNewBreed = newLevel > cur.highestUnlockedLevel;
+
           setState((prev) => {
             const base = ensureDailyReset(prev);
             const nextBoard = [...base.board];
@@ -459,11 +502,6 @@ export default function App() {
               soundEngine.playFever();
             }
 
-            if (newLevel > base.highestUnlockedLevel) {
-              notifyHappyTime();
-              showToast(`Открыта новая порода: ${CAT_TIERS[newLevel - 1].name}!`);
-            }
-
             return {
               ...base,
               coins: base.coins + mergeReward,
@@ -479,6 +517,14 @@ export default function App() {
               tutorialStep: base.tutorialStep === 0 ? 1 : base.tutorialStep,
             };
           });
+
+          if (isNewBreed) {
+            notifyHappyTime();
+            showToast(`Открыта новая порода: ${CAT_TIERS[newLevel - 1].name}!`);
+            if (newLevel >= 5 && newLevel % 2 === 1) {
+              void showInterstitialWithPause(false);
+            }
+          }
 
           const tier = CAT_TIERS[newLevel - 1];
           const label =
@@ -572,7 +618,7 @@ export default function App() {
       controller.dispose();
       sceneRef.current = null;
     };
-  }, [pushFloating, showToast]);
+  }, [pushFloating, showToast, showInterstitialWithPause]);
 
   // Sync board, theme, PS2 filter, ASMR mode, fish rain & fever state
   useEffect(() => {
@@ -610,6 +656,7 @@ export default function App() {
   // Passive Income, Live Crate Progress Visualizer, Combo decay & Mouse status loop
   useEffect(() => {
     const timer = window.setInterval(() => {
+      if (hardPausedRef.current) return;
       const t = Date.now();
       setNowMs(t);
       setMouseOnBoard(Boolean(sceneRef.current?.isMouseActive()));
@@ -696,6 +743,10 @@ export default function App() {
     let timeoutId = 0;
 
     const triggerRandomEvent = () => {
+      if (hardPausedRef.current) {
+        timeoutId = window.setTimeout(triggerRandomEvent, 5000);
+        return;
+      }
       const cur = stateRef.current;
       const emptyIndices: number[] = [];
       cur.board.forEach((slot, idx) => {
@@ -1034,7 +1085,8 @@ export default function App() {
 
   const openRewardedAd = async (offer: RewardedAdOffer) => {
     const portalResult = await tryPortalRewardedVideo((paused) => {
-      soundEngine.setBackgroundPaused(paused);
+      adPausedRef.current = paused;
+      syncHardPause();
     });
     if (portalResult === 'rewarded') {
       applyAdReward(offer);
@@ -1122,9 +1174,10 @@ export default function App() {
     showToast(`Бонус дня получен: ${reward.label}!`);
   };
 
-  const handlePrestige = () => {
+  const handlePrestige = async () => {
     const gain = getPendingGoldenFish(state.highestUnlockedLevel, state.totalMerges);
     if (gain <= 0) return;
+    await showInterstitialWithPause(true);
     soundEngine.playFever();
     notifyHappyTime();
     setState((prev) =>

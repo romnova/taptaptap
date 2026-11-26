@@ -1,8 +1,15 @@
-// Universal HTML5 Game Portal Bridge (Yandex Games, Poki, CrazyGames, itch.io / standalone)
-// Safely detects host portal SDKs when embedded and falls back cleanly in standalone mode.
+// Universal HTML5 Game Portal Bridge (Yandex Games, CrazyGames, Poki, Standalone)
+// Safely detects host portal SDKs when embedded and falls back cleanly in local/standalone mode.
 
 interface YandexSdk {
   adv?: {
+    showFullscreenAdv?: (opts: {
+      callbacks: {
+        onOpen?: () => void;
+        onClose?: (wasShown?: boolean) => void;
+        onError?: (err: unknown) => void;
+      };
+    }) => void;
     showRewardedVideo?: (opts: {
       callbacks: {
         onOpen?: () => void;
@@ -28,12 +35,16 @@ interface PokiSdk {
   gameLoadingFinished?: () => void;
   gameplayStart?: () => void;
   gameplayStop?: () => void;
+  commercialBreak?: () => Promise<void>;
   rewardedBreak?: () => Promise<boolean>;
 }
 
 interface CrazyGamesSdk {
   SDK?: {
+    init?: () => Promise<void>;
     game?: {
+      loadingStart?: () => void;
+      loadingStop?: () => void;
       gameplayStart?: () => void;
       gameplayStop?: () => void;
       happytime?: () => void;
@@ -44,7 +55,7 @@ interface CrazyGamesSdk {
         callbacks: {
           adStarted?: () => void;
           adFinished?: () => void;
-          adError?: () => void;
+          adError?: (err?: unknown) => void;
         },
       ) => void;
     };
@@ -61,6 +72,7 @@ declare global {
 
 let ysdkInstance: YandexSdk | null = null;
 let pokiReady = false;
+let crazyReady = false;
 const memoryStorage = new Map<string, string>();
 
 export function safeLoadStorage(key: string): string | null {
@@ -83,6 +95,7 @@ export function safeSaveStorage(key: string, value: string): void {
 export async function initPortalBridge(): Promise<void> {
   if (typeof window === 'undefined') return;
 
+  // 1. Yandex Games SDK
   if (window.YaGames?.init) {
     try {
       ysdkInstance = await window.YaGames.init();
@@ -94,6 +107,7 @@ export async function initPortalBridge(): Promise<void> {
     }
   }
 
+  // 2. Poki SDK
   if (window.PokiSDK?.init) {
     try {
       await window.PokiSDK.init();
@@ -106,30 +120,142 @@ export async function initPortalBridge(): Promise<void> {
     }
   }
 
-  window.CrazyGames?.SDK?.game?.gameplayStart?.();
+  // 3. CrazyGames SDK v3
+  if (window.CrazyGames?.SDK) {
+    try {
+      if (window.CrazyGames.SDK.init) {
+        await window.CrazyGames.SDK.init();
+      }
+      crazyReady = true;
+      window.CrazyGames.SDK.game?.loadingStop?.();
+      window.CrazyGames.SDK.game?.gameplayStart?.();
+    } catch {
+      crazyReady = false;
+    }
+  }
 }
 
 export function notifyGameplayStart(): void {
   if (typeof window === 'undefined') return;
-  ysdkInstance?.features?.GameplayAPI?.start?.();
-  if (pokiReady) window.PokiSDK?.gameplayStart?.();
-  window.CrazyGames?.SDK?.game?.gameplayStart?.();
+  try {
+    ysdkInstance?.features?.GameplayAPI?.start?.();
+    if (pokiReady) window.PokiSDK?.gameplayStart?.();
+    if (crazyReady) window.CrazyGames?.SDK?.game?.gameplayStart?.();
+  } catch {
+    // Ignore SDK errors in local/offline runs
+  }
 }
 
 export function notifyGameplayStop(): void {
   if (typeof window === 'undefined') return;
-  ysdkInstance?.features?.GameplayAPI?.stop?.();
-  if (pokiReady) window.PokiSDK?.gameplayStop?.();
-  window.CrazyGames?.SDK?.game?.gameplayStop?.();
+  try {
+    ysdkInstance?.features?.GameplayAPI?.stop?.();
+    if (pokiReady) window.PokiSDK?.gameplayStop?.();
+    if (crazyReady) window.CrazyGames?.SDK?.game?.gameplayStop?.();
+  } catch {
+    // Ignore SDK errors in local/offline runs
+  }
 }
 
 export function notifyHappyTime(): void {
   if (typeof window === 'undefined') return;
-  window.CrazyGames?.SDK?.game?.happytime?.();
+  try {
+    if (crazyReady) window.CrazyGames?.SDK?.game?.happytime?.();
+  } catch {
+    // Ignore SDK errors
+  }
+}
+
+export async function tryPortalInterstitialAd(
+  onPauseChange: (paused: boolean) => void,
+): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+
+  // 1. Yandex Games Fullscreen Interstitial Ad
+  if (ysdkInstance?.adv?.showFullscreenAdv) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (shown: boolean) => {
+        if (settled) return;
+        settled = true;
+        onPauseChange(false);
+        notifyGameplayStart();
+        resolve(shown);
+      };
+
+      try {
+        ysdkInstance?.adv?.showFullscreenAdv?.({
+          callbacks: {
+            onOpen: () => {
+              onPauseChange(true);
+              notifyGameplayStop();
+            },
+            onClose: (wasShown) => {
+              finish(Boolean(wasShown));
+            },
+            onError: () => {
+              finish(false);
+            },
+          },
+        });
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  // 2. CrazyGames Midgame Interstitial Ad
+  if (crazyReady && window.CrazyGames?.SDK?.ad?.requestAd) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (shown: boolean) => {
+        if (settled) return;
+        settled = true;
+        onPauseChange(false);
+        notifyGameplayStart();
+        resolve(shown);
+      };
+
+      try {
+        window.CrazyGames?.SDK?.ad?.requestAd?.('midgame', {
+          adStarted: () => {
+            onPauseChange(true);
+            notifyGameplayStop();
+          },
+          adFinished: () => {
+            finish(true);
+          },
+          adError: () => {
+            finish(false);
+          },
+        });
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  // 3. Poki Commercial Break
+  if (pokiReady && window.PokiSDK?.commercialBreak) {
+    try {
+      onPauseChange(true);
+      notifyGameplayStop();
+      await window.PokiSDK.commercialBreak();
+      onPauseChange(false);
+      notifyGameplayStart();
+      return true;
+    } catch {
+      onPauseChange(false);
+      notifyGameplayStart();
+      return false;
+    }
+  }
+
+  return false;
 }
 
 export async function tryPortalRewardedVideo(
-  onPauseAudio: (paused: boolean) => void,
+  onPauseChange: (paused: boolean) => void,
 ): Promise<'rewarded' | 'declined' | 'unavailable'> {
   if (typeof window === 'undefined') return 'unavailable';
 
@@ -137,65 +263,83 @@ export async function tryPortalRewardedVideo(
   if (ysdkInstance?.adv?.showRewardedVideo) {
     return new Promise((resolve) => {
       let rewarded = false;
-      ysdkInstance?.adv?.showRewardedVideo?.({
-        callbacks: {
-          onOpen: () => {
-            onPauseAudio(true);
-            notifyGameplayStop();
+      let settled = false;
+      const finish = (result: 'rewarded' | 'declined' | 'unavailable') => {
+        if (settled) return;
+        settled = true;
+        onPauseChange(false);
+        notifyGameplayStart();
+        resolve(result);
+      };
+
+      try {
+        ysdkInstance?.adv?.showRewardedVideo?.({
+          callbacks: {
+            onOpen: () => {
+              onPauseChange(true);
+              notifyGameplayStop();
+            },
+            onRewarded: () => {
+              rewarded = true;
+            },
+            onClose: () => {
+              finish(rewarded ? 'rewarded' : 'declined');
+            },
+            onError: () => {
+              finish('unavailable');
+            },
           },
-          onRewarded: () => {
-            rewarded = true;
-          },
-          onClose: () => {
-            onPauseAudio(false);
-            notifyGameplayStart();
-            resolve(rewarded ? 'rewarded' : 'declined');
-          },
-          onError: () => {
-            onPauseAudio(false);
-            notifyGameplayStart();
-            resolve('unavailable');
-          },
-        },
-      });
+        });
+      } catch {
+        finish('unavailable');
+      }
     });
   }
 
   // 2. Poki Rewarded Break
   if (pokiReady && window.PokiSDK?.rewardedBreak) {
     try {
-      onPauseAudio(true);
+      onPauseChange(true);
       notifyGameplayStop();
       const ok = await window.PokiSDK.rewardedBreak();
-      onPauseAudio(false);
+      onPauseChange(false);
       notifyGameplayStart();
       return ok ? 'rewarded' : 'declined';
     } catch {
-      onPauseAudio(false);
+      onPauseChange(false);
       notifyGameplayStart();
       return 'unavailable';
     }
   }
 
   // 3. CrazyGames Rewarded Ad
-  if (window.CrazyGames?.SDK?.ad?.requestAd) {
+  if (crazyReady && window.CrazyGames?.SDK?.ad?.requestAd) {
     return new Promise((resolve) => {
-      window.CrazyGames?.SDK?.ad?.requestAd?.('rewarded', {
-        adStarted: () => {
-          onPauseAudio(true);
-          notifyGameplayStop();
-        },
-        adFinished: () => {
-          onPauseAudio(false);
-          notifyGameplayStart();
-          resolve('rewarded');
-        },
-        adError: () => {
-          onPauseAudio(false);
-          notifyGameplayStart();
-          resolve('unavailable');
-        },
-      });
+      let settled = false;
+      const finish = (result: 'rewarded' | 'declined' | 'unavailable') => {
+        if (settled) return;
+        settled = true;
+        onPauseChange(false);
+        notifyGameplayStart();
+        resolve(result);
+      };
+
+      try {
+        window.CrazyGames?.SDK?.ad?.requestAd?.('rewarded', {
+          adStarted: () => {
+            onPauseChange(true);
+            notifyGameplayStop();
+          },
+          adFinished: () => {
+            finish('rewarded');
+          },
+          adError: () => {
+            finish('unavailable');
+          },
+        });
+      } catch {
+        finish('unavailable');
+      }
     });
   }
 

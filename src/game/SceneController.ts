@@ -71,6 +71,7 @@ export class SceneController {
   private isSoftwareGl: boolean;
   private frameId = 0;
   private disposed = false;
+  private paused = false;
 
   private boardGroup = new THREE.Group();
   private boardBaseMesh!: THREE.Mesh;
@@ -242,6 +243,22 @@ export class SceneController {
 
   public setFlashSaleMode(active: boolean): void {
     this.flashSaleActive = active;
+  }
+
+  public setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    if (paused) {
+      this.dragState.active = false;
+      this.dragState.fromIndex = -1;
+      this.dragState.hoveredIndex = -1;
+      this.dragState.moved = false;
+      this.renderer.domElement.style.cursor = 'default';
+      this.clock.stop();
+    } else {
+      this.clock.start();
+      this.clock.getDelta();
+    }
   }
 
   public setAsmrMode(mode: AsmrToyMode): void {
@@ -891,6 +908,7 @@ export class SceneController {
   }
 
   private onPointerDown = (e: PointerEvent): void => {
+    if (this.paused) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;
 
     // Check Golden Mouse catch FIRST!
@@ -1061,11 +1079,12 @@ export class SceneController {
   private startLoop(): void {
     const tick = () => {
       if (this.disposed) return;
-      const dt = Math.min(0.05, this.clock.getDelta());
-      const elapsed = this.clock.elapsedTime;
-
-      this.updateScene(dt, elapsed);
-      this.renderer.render(this.scene, this.camera);
+      if (!this.paused) {
+        const dt = Math.min(0.05, this.clock.getDelta());
+        const elapsed = this.clock.elapsedTime;
+        this.updateScene(dt, elapsed);
+        this.renderer.render(this.scene, this.camera);
+      }
 
       if (this.isSoftwareGl) {
         this.afterDraw(tick);
