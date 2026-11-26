@@ -1,0 +1,6 @@
+{
+  "name": "Neko Merge DX — 3D Cat Merge Game",
+  "description": "Стильная 3D HTML5 игра слияния про котов в эстетике минимализма эпохи PS2 с системой прогрессии, бустерами и монетизацией.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
